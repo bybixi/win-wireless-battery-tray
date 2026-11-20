@@ -36,8 +36,9 @@ APP_NAME = "雷蛇电量托盘"
 TRAY_CLASS = "RazerViperBatteryTrayWnd"
 PANEL_TITLE = "无线外设电量"
 DEBUG_TITLE = "无线外设电量 · 调试"
-HERE = os.path.dirname(os.path.realpath(__file__))
-SCRIPT = os.path.realpath(__file__)
+FROZEN = bool(getattr(sys, "frozen", False))
+HERE = os.path.dirname(os.path.realpath(sys.executable if FROZEN else __file__))
+SCRIPT = os.path.realpath(sys.executable if FROZEN else __file__)
 CONFIG_PATH = os.path.join(HERE, "config.json")
 LAUNCHER = os.path.join(HERE, "启动电量托盘.pyw")
 ICON_PATH = os.path.join(HERE, "icon.ico")
@@ -1380,6 +1381,21 @@ def pythonw_exe():
     return cand if os.path.exists(cand) else exe
 
 
+def self_cmd(*extra_args):
+    """返回启动自身子进程（面板 / 调试窗口）的命令行，兼容源码和 PyInstaller 单文件 exe。"""
+    if FROZEN:
+        return [SCRIPT, *extra_args]
+    return [pythonw_exe(), SCRIPT, *extra_args]
+
+
+def self_lnk_target():
+    """返回快捷方式 (target, args, icon)。"""
+    if FROZEN:
+        return SCRIPT, "", SCRIPT
+    ico = ICON_PATH if os.path.exists(ICON_PATH) else ""
+    return pythonw_exe(), f'"{SCRIPT}"', ico
+
+
 def create_lnk(lnk, target, args="", workdir="", desc="", icon=""):
     ole32.CoInitialize(None)
     psl = ctypes.c_void_p()
@@ -1442,13 +1458,13 @@ def set_autostart(on):
     lnk = startup_lnk()
     name = APP_NAME + ".lnk"
     if on:
-        if not os.path.exists(ICON_PATH):
+        if not FROZEN and not os.path.exists(ICON_PATH):
             try:
                 write_app_icon()
             except Exception:
                 pass
-        create_lnk(lnk, pythonw_exe(), f'"{SCRIPT}"', HERE, "无线外设电量托盘",
-                   ICON_PATH if os.path.exists(ICON_PATH) else "")
+        target, args, ico = self_lnk_target()
+        create_lnk(lnk, target, args, HERE, "无线外设电量托盘", ico)
         if _approved_get(name) is not None:
             _approved_set(name, True)
     else:
@@ -1473,7 +1489,14 @@ def make_desktop_links():
 
     flink = os.path.join(desk, os.path.basename(LAUNCHER))
     flnk = os.path.join(desk, "启动电量托盘.lnk")
-    if not os.path.lexists(flink) and not os.path.lexists(flnk):
+    if FROZEN:
+        if not os.path.lexists(flnk):
+            target, args, ico = self_lnk_target()
+            create_lnk(flnk, target, args, HERE, "启动无线外设电量托盘", ico)
+            msgs.append(f"桌面快捷方式：{flnk}")
+        else:
+            msgs.append(f"已存在：{flnk}")
+    elif not os.path.lexists(flink) and not os.path.lexists(flnk):
         try:
             os.symlink(LAUNCHER, flink)
             msgs.append(f"文件符号链接：{flink}")
@@ -1482,8 +1505,8 @@ def make_desktop_links():
                 os.link(LAUNCHER, flink)
                 msgs.append(f"文件硬链接：{flink}")
             except OSError:
-                create_lnk(flnk, pythonw_exe(), f'"{SCRIPT}"', HERE, "启动无线外设电量托盘",
-                           ICON_PATH if os.path.exists(ICON_PATH) else "")
+                target, args, ico = self_lnk_target()
+                create_lnk(flnk, target, args, HERE, "启动无线外设电量托盘", ico)
                 msgs.append(f"跨盘启动快捷方式：{flnk}")
     else:
         msgs.append(f"已存在：{flink if os.path.lexists(flink) else flnk}")
@@ -1575,7 +1598,7 @@ def bring_or_launch_panel():
         user32.SetForegroundWindow(hw)
         return
     user32.AllowSetForegroundWindow(0xFFFFFFFF)
-    subprocess.Popen([pythonw_exe(), SCRIPT, "--panel"], cwd=HERE, close_fds=True,
+    subprocess.Popen(self_cmd("--panel"), cwd=HERE, close_fds=True,
                      creationflags=0x08000000)
 
 
@@ -2252,7 +2275,7 @@ class Panel:
             user32.PostMessageW(hw, WM_RELOAD, 0, 0)
 
     def open_debug(self):
-        subprocess.Popen([pythonw_exe(), SCRIPT, "--debug-ui"], cwd=HERE, close_fds=True,
+        subprocess.Popen(self_cmd("--debug-ui"), cwd=HERE, close_fds=True,
                          creationflags=0x08000000)
         self.close()
 
@@ -2662,8 +2685,23 @@ def cmd_uninstall():
     return 0
 
 
+def _attach_console_if_cli(argv):
+    """单文件 GUI exe 在命令行带 --once/--scan/--debug 等参数时，附着到父控制台以便输出。"""
+    if not FROZEN:
+        return
+    if not any(f in argv for f in ("--once", "--scan", "--install", "--uninstall", "--debug")):
+        return
+    try:
+        if kernel32.AttachConsole(wt.DWORD(-1)):
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+    except Exception:
+        pass
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    _attach_console_if_cli(argv)
     if "--once" in argv:
         return cmd_once()
     if "--scan" in argv:

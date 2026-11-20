@@ -3,4 +3,7 @@ __pycache__/
 config.json
 icon.ico
 preview/
+build/
+dist/
+*.spec
 *.log

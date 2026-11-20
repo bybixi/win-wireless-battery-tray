@@ -26,12 +26,20 @@
 
 ## 快速开始
 
-### 环境要求
+### 方式一：直接下载 EXE（免装 Python）
+
+前往 [Releases](https://github.com/bybixi/win-wireless-battery-tray/releases) 下载 `WirelessBatteryTray.exe`：
+- 直接双击即可无黑窗运行在任务栏托盘；
+- 右键托盘图标打开面板即可一键开启「开机自启」（配置文件 `config.json` 保存在同级目录）。
+
+### 方式二：Python 源码运行
+
+#### 环境要求
 
 - Windows 10 / 11（64 位）
 - Python 3.10+（仅标准库，无需 `pip install`）
 
-### 安装开机自启并启动
+#### 安装开机自启并启动
 
 ```powershell
 # 1. 创建开机自启快捷方式与桌面入口
