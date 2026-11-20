@@ -64,11 +64,11 @@ DEV_BY_ID = {d["id"]: d for d in DEVICES}
 #   bat_pct   = 上方 Win11 横向电池 + 下方电量百分比
 #   pct_only  = 纯大号百分比数字
 VALID_STYLES = ("dev_pct", "bt_single", "bat_pct", "pct_only")
-VALID_MODES = ("lowest", "all")
+VALID_MODES = ("smart", "lowest", "all")
 
 DEFAULT_CONFIG = {
     "interval": 60,           # 刷新间隔（秒），30 ~ 1800
-    "tray_mode": "lowest",    # lowest = 仅显示 1 个图标（默认显示电量最低的在线设备）；all = 三台各显 1 个
+    "tray_mode": "smart",     # smart=单图标智能（≤80%充电优先，否则最低电量）；lowest=单图标最低电量；all=三台各显1个
     "style": "dev_pct",       # 图标样式
     "enabled": {"mouse": True, "headset": True, "gamepad": True},
     "low_alert": 20,          # 低电量通知阈值（%），0 关闭
@@ -1645,8 +1645,12 @@ class Tray:
         n.uCallbackMessage = WM_TRAY
         return n
 
-    def _pick_lowest_dev(self):
-        """从当前在线设备里挑出电量最低的（同电量时优先未充电的）；全离线则兜底最近读数最低或鼠标。"""
+    def _pick_single_dev(self, smart=True):
+        """单图标选设备：
+        - 智能模式（smart=True）：优先显示正在充电且电量 ≤ 80% 的在线设备（多台同时充则取电量最低的）；
+          当充电设备超过 80% 或无设备充电时，回退到电量最低的在线设备。
+        - 仅最低模式（smart=False）：始终显示电量最低的在线设备（同电量优先未充电的）。
+        """
         enabled = self.cfg.get("enabled", {})
         online = []
         for idx, d in enumerate(DEVICES):
@@ -1655,8 +1659,13 @@ class Tray:
                 continue
             r = self.latest.get(did)
             if r is not None and r.ok and r.level is not None:
-                online.append((r.level, 1 if r.charging else 0, idx, did))
+                online.append((r.level, 1 if r.charging else 0, idx, did, r.charging))
         if online:
+            if smart:
+                charging_prio = [(lv, idx, did) for lv, _, idx, did, ch in online if ch and lv <= 80]
+                if charging_prio:
+                    charging_prio.sort()
+                    return charging_prio[0][2]
             online.sort()
             return online[0][3]
         cached = []
@@ -1673,7 +1682,7 @@ class Tray:
         return "mouse"
 
     def tooltip_summary(self, active_id):
-        """单图标模式下悬停一次查看全部三台设备电量，当前显示的最低电量设备标 ▶。"""
+        """单图标模式下悬停一次查看全部三台设备电量，当前显示的设备标 ▶。"""
         lines = []
         latest_t = None
         for d in DEVICES:
@@ -1696,7 +1705,7 @@ class Tray:
         return "\n".join(lines)[:127]
 
     def tooltip_for(self, dev_id):
-        if self.cfg.get("tray_mode", "lowest") == "lowest":
+        if self.cfg.get("tray_mode", "smart") in ("smart", "lowest"):
             return self.tooltip_summary(dev_id)
         name = DEV_BY_ID[dev_id]["name"]
         r = self.latest.get(dev_id)
@@ -1722,10 +1731,11 @@ class Tray:
             user32.DestroyIcon(old)
 
     def _desired_icons(self):
-        """返回 [(uid, dev_id, kind)]；lowest 模式严格只显示 1 个图标（uID=11）。"""
+        """返回 [(uid, dev_id, kind)]；smart / lowest 模式严格只显示 1 个图标（uID=11）。"""
         style = self.cfg["style"]
-        if self.cfg.get("tray_mode", "lowest") == "lowest":
-            return [(11, self._pick_lowest_dev(), style)]
+        mode = self.cfg.get("tray_mode", "smart")
+        if mode in ("smart", "lowest"):
+            return [(11, self._pick_single_dev(smart=(mode == "smart")), style)]
         enabled = self.cfg.get("enabled", {})
         specs = []
         # 倒序添加，使视觉上从左到右为：鼠标 → 耳机 → 手柄
@@ -2167,8 +2177,8 @@ class Panel:
     def _mode_widget(self, parent):
         return self._segmented(
             parent,
-            [("lowest", "仅最低电量"), ("all", "全部设备")],
-            [self.cfg.get("tray_mode", "lowest")],
+            [("smart", "智能"), ("lowest", "仅最低"), ("all", "全部")],
+            [self.cfg.get("tray_mode", "smart")],
             self.set_mode,
         )
 
@@ -2265,7 +2275,7 @@ class Panel:
     def save_and_notify(self):
         disk = load_config()
         disk.update({
-            "tray_mode": self.cfg.get("tray_mode", "lowest"),
+            "tray_mode": self.cfg.get("tray_mode", "smart"),
             "style": self.cfg["style"],
             "interval": self.cfg["interval"],
         })
