@@ -114,11 +114,18 @@ def load_config():
 
 
 def save_config(cfg):
+    tmp = CONFIG_PATH + ".tmp"
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(dict(cfg), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         dlog("保存配置失败", e)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _hexlist(xs):
@@ -264,32 +271,38 @@ class Reading:
         self.time = datetime.datetime.now()
 
 
-class NamedMutex:
-    def __init__(self, name):
-        self.h = kernel32.CreateMutexW(None, False, name)
-        self._owned = False
+class _MutexGuard:
+    """每次 with 获取独立持有状态，避免多线程争用同一 NamedMutex 实例时互相覆盖释放标志。"""
+
+    def __init__(self, handle, timeout_ms=5000):
+        self.h = handle
+        self.timeout_ms = timeout_ms
+        self.owned = False
 
     def __enter__(self):
-        self._owned = False
+        self.owned = False
         if self.h:
-            rc = kernel32.WaitForSingleObject(self.h, 5000)
-            self._owned = rc in (0, 0x80)    # WAIT_OBJECT_0 / WAIT_ABANDONED
+            rc = kernel32.WaitForSingleObject(self.h, self.timeout_ms)
+            self.owned = rc in (0, 0x80)    # WAIT_OBJECT_0 / WAIT_ABANDONED
         return self
 
     def __exit__(self, *a):
-        if self.h and self._owned:
+        if self.h and self.owned:
             kernel32.ReleaseMutex(self.h)
-            self._owned = False
+            self.owned = False
 
 
-_MUTEXES = {}
+_MUTEX_HANDLES = {}
+_MUTEX_INIT_LOCK = threading.Lock()
 
 
-def hid_mutex(name="Local\\RazerViperBatteryHID"):
-    m = _MUTEXES.get(name)
-    if m is None:
-        m = _MUTEXES[name] = NamedMutex(name)
-    return m
+def hid_mutex(name="Local\\RazerViperBatteryHID", timeout_ms=5000):
+    with _MUTEX_INIT_LOCK:
+        h = _MUTEX_HANDLES.get(name)
+        if h is None:
+            h = kernel32.CreateMutexW(None, False, name)
+            _MUTEX_HANDLES[name] = h
+    return _MutexGuard(h, timeout_ms)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -479,7 +492,14 @@ def read_viper(cfg=None):
                     dlog(f"[mouse] {info.pid:04X} MI_{info.mi} tid={tid:02X} access={mode} → {st}")
                     if st == "ok":
                         _good_tid[info.pid] = tid
-                        level = max(0, min(100, round(resp[vidx] * 100 / vscale)))
+                        raw_val = resp[vidx]
+                        # 雷蛇无线鼠标刚从休眠唤醒时偶发返回 0，复读一次排除假 0%
+                        if raw_val == 0:
+                            time.sleep(0.15)
+                            st_re, resp_re = razer_transact(h, tid, bcls, bcmd, bsize)
+                            if st_re == "ok":
+                                raw_val = resp_re[vidx]
+                        level = max(0, min(100, round(raw_val * 100 / vscale)))
                         charging = False
                         st2, r2 = razer_transact(h, tid, ccls, ccmd, csize)
                         if st2 == "ok":
@@ -547,6 +567,7 @@ def read_hecate_g3(cfg=None):
                 got = wt.DWORD()
                 ok_r = kernel32.ReadFile(hr, rbuf, in_len, ctypes.byref(got), ctypes.byref(ov_r))
                 err_r = ctypes.get_last_error()
+                pending_r = (not ok_r) and (err_r == 997)
 
                 wbuf = (ctypes.c_ubyte * out_len)()
                 wbuf[0], wbuf[1], wbuf[2], wbuf[3], wbuf[4] = rid, 0x35, 0xBB, 0x01, 0x00
@@ -561,32 +582,38 @@ def read_hecate_g3(cfg=None):
                             kernel32.GetOverlappedResult(hw, ctypes.byref(ov_w), ctypes.byref(wr), False)
                         else:
                             kernel32.CancelIoEx(hw, ctypes.byref(ov_w))
-                            kernel32.WaitForSingleObject(ev_w, 200)
+                            kernel32.GetOverlappedResult(hw, ctypes.byref(ov_w), ctypes.byref(wr), True)
                     else:
                         dlog(f"[headset] WriteFile 失败 {ew}")
 
                 deadline = time.monotonic() + 0.65
                 matched = None
-                while time.monotonic() < deadline:
-                    rem = int(max(1, (deadline - time.monotonic()) * 1000))
-                    if ok_r or (err_r == 997 and kernel32.WaitForSingleObject(ev_r, rem) == 0):
-                        if not ok_r:
-                            kernel32.GetOverlappedResult(hr, ctypes.byref(ov_r), ctypes.byref(got), False)
-                        rep = bytes(rbuf)[:got.value]
-                        dlog(f"[headset] recv: {rep[:16].hex(' ')}")
-                        if len(rep) >= 8 and rep[1] == 0x35 and rep[2] == 0xBB and rep[4] == 0x00 and rep[3] >= 4:
-                            matched = rep
+                try:
+                    while time.monotonic() < deadline:
+                        rem = int(max(1, (deadline - time.monotonic()) * 1000))
+                        if ok_r or (pending_r and kernel32.WaitForSingleObject(ev_r, rem) == 0):
+                            if pending_r:
+                                kernel32.GetOverlappedResult(hr, ctypes.byref(ov_r), ctypes.byref(got), False)
+                                pending_r = False
+                            rep = bytes(rbuf)[:got.value]
+                            dlog(f"[headset] recv: {rep[:16].hex(' ')}")
+                            if len(rep) >= 8 and rep[1] == 0x35 and rep[2] == 0xBB and rep[4] == 0x00 and rep[3] >= 4:
+                                matched = rep
+                                break
+                            rbuf = (ctypes.c_ubyte * in_len)()
+                            ov_r = OVERLAPPED(hEvent=ev_r)
+                            kernel32.ResetEvent(ev_r)
+                            ok_r = kernel32.ReadFile(hr, rbuf, in_len, ctypes.byref(got), ctypes.byref(ov_r))
+                            err_r = ctypes.get_last_error()
+                            pending_r = (not ok_r) and (err_r == 997)
+                        else:
                             break
-                        rbuf = (ctypes.c_ubyte * in_len)()
-                        ov_r = OVERLAPPED(hEvent=ev_r)
-                        kernel32.ResetEvent(ev_r)
-                        ok_r = kernel32.ReadFile(hr, rbuf, in_len, ctypes.byref(got), ctypes.byref(ov_r))
-                        err_r = ctypes.get_last_error()
-                    else:
-                        break
-                if not ok_r and err_r == 997:
-                    kernel32.CancelIoEx(hr, ctypes.byref(ov_r))
-                    kernel32.WaitForSingleObject(ev_r, 200)
+                finally:
+                    # 必须等异步读彻底取消/完成后再释放 rbuf 和 ov_r，避免内核写入已释放内存
+                    if pending_r:
+                        kernel32.CancelIoEx(hr, ctypes.byref(ov_r))
+                        kernel32.GetOverlappedResult(hr, ctypes.byref(ov_r), ctypes.byref(got), True)
+                        pending_r = False
 
                 if matched:
                     connected = (not wireless) or (matched[5] == 1)
@@ -749,8 +776,8 @@ READERS = {
 }
 
 
-def read_all(cfg=None):
-    """并行读取三台设备，互不阻塞，返回 {dev_id: Reading}。"""
+def read_all(cfg=None, total_timeout=7.0):
+    """并行读取三台设备，共享总超时上限（默认 7 秒），互不阻塞。"""
     cfg = cfg or load_config()
     out = {}
     threads = []
@@ -765,8 +792,9 @@ def read_all(cfg=None):
         t = threading.Thread(target=run_one, args=(d["id"], READERS[d["id"]]), daemon=True)
         t.start()
         threads.append(t)
+    deadline = time.monotonic() + total_timeout
     for t in threads:
-        t.join(timeout=8)
+        t.join(timeout=max(0.05, deadline - time.monotonic()))
     for d in DEVICES:
         out.setdefault(d["id"], Reading(d["id"], state="error", msg="读取超时"))
     return out
@@ -1555,6 +1583,7 @@ class NOTIFYICONDATAW(ctypes.Structure):
 user32.DefWindowProcW.restype = LRESULT
 user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.UnregisterClassW.argtypes = [wt.LPCWSTR, wt.HINSTANCE]
 user32.CreateWindowExW.restype = wt.HWND
 user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
                                    ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, ctypes.c_void_p]
@@ -1574,13 +1603,31 @@ user32.SetForegroundWindow.argtypes = [wt.HWND]
 user32.IsIconic.argtypes = [wt.HWND]
 user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wt.UINT
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
+
+
+class POWERBROADCAST_SETTING(ctypes.Structure):
+    _fields_ = [("PowerSetting", GUID), ("DataLength", wt.DWORD), ("Data", wt.DWORD)]
+
+
+GUID_CONSOLE_DISPLAY_STATE = make_guid("{6FE69556-704A-47A0-8F24-C28D936FDA47}")
+
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.AllowSetForegroundWindow.argtypes = [wt.DWORD]
+user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+kernel32.GetTickCount.restype = wt.DWORD
 shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 try:
     user32.RegisterSuspendResumeNotification.restype = HANDLE
     user32.RegisterSuspendResumeNotification.argtypes = [HANDLE, wt.DWORD]
     user32.UnregisterSuspendResumeNotification.argtypes = [HANDLE]
+except Exception:
+    pass
+try:
+    user32.RegisterPowerSettingNotification.restype = HANDLE
+    user32.RegisterPowerSettingNotification.argtypes = [HANDLE, ctypes.POINTER(GUID), wt.DWORD]
+    user32.UnregisterPowerSettingNotification.argtypes = [HANDLE]
 except Exception:
     pass
 try:
@@ -1594,6 +1641,7 @@ WM_DESTROY, WM_CLOSE, WM_TIMER, WM_SETTINGCHANGE = 0x0002, 0x0010, 0x0113, 0x001
 WM_POWERBROADCAST, WM_DEVICECHANGE, WM_WTSSESSION_CHANGE = 0x0218, 0x0219, 0x02B1
 WM_DPICHANGED, WM_ENDSESSION = 0x02E0, 0x0016
 PBT_APMSUSPEND, PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC = 0x0004, 0x0007, 0x0012
+PBT_POWERSETTINGCHANGE = 0x8013
 WTS_SESSION_UNLOCK = 0x0008
 WM_LBUTTONUP, WM_RBUTTONUP, WM_APP = 0x0202, 0x0205, 0x8000
 WM_TRAY = WM_APP + 1
@@ -1602,7 +1650,16 @@ WM_RELOAD = WM_APP + 3
 WM_REFRESH = WM_APP + 4
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 1, 2, 4, 0x10
-TIMER_POLL, TIMER_DEVCHANGE, TIMER_RETRY, TIMER_RESUME = 1, 2, 3, 4
+TIMER_POLL, TIMER_DEVCHANGE, TIMER_RETRY, TIMER_RESUME, TIMER_WAKE_MOUSE = 1, 2, 3, 4, 5
+
+
+def last_input_info():
+    """返回 (上次用户输入时间戳 ms, 当前空闲时长 ms)，零 HID 通信。"""
+    lii = LASTINPUTINFO(cbSize=ctypes.sizeof(LASTINPUTINFO))
+    if not user32.GetLastInputInfo(ctypes.byref(lii)):
+        return None, 0
+    idle = (kernel32.GetTickCount() - lii.dwTime) & 0xFFFFFFFF
+    return lii.dwTime, idle
 
 
 def find_tray_hwnd():
@@ -1635,8 +1692,13 @@ class Tray:
         self.result_q = queue.Queue()
         self.low_alerted = set()  # 已发过低电提醒的 dev_id
         self.retry_left = 15
-        self._wake_delays = []    # 休眠/解锁后分段重试延时（毫秒）
+        self._wake_delays = []    # 休眠/亮屏/解锁后分段重试延时（毫秒）
+        self._suspend_until = 0.0
+        self._last_poll_wall = time.time()
+        self._sleep_input_tick = None
+        self._display_state = None
         self._power_reg = None
+        self._disp_reg = None
         self._wts_reg = False
         self._theme_sig = None    # (light, icon_size) 缓存，避免无关 WM_SETTINGCHANGE 反复重绘
         self._wndproc = WNDPROC(self._proc)
@@ -1650,11 +1712,16 @@ class Tray:
         wc.lpszClassName = TRAY_CLASS
         user32.RegisterClassW(ctypes.byref(wc))
         self.hwnd = user32.CreateWindowExW(0, TRAY_CLASS, APP_NAME, 0, 0, 0, 0, 0, None, None, hinst, None)
-        # 注册电源休眠/现代待机唤醒与会话解锁通知（Win11 Modern Standby 必须显式注册）
+        # 注册电源休眠/现代待机、显示器亮灭（Win11 Modern Standby 核心唤醒信号）与会话解锁通知
         try:
             self._power_reg = user32.RegisterSuspendResumeNotification(self.hwnd, 0)
         except Exception:
             self._power_reg = None
+        try:
+            self._disp_reg = user32.RegisterPowerSettingNotification(
+                self.hwnd, ctypes.byref(GUID_CONSOLE_DISPLAY_STATE), 0)
+        except Exception:
+            self._disp_reg = None
         if wtsapi32 is not None:
             try:
                 self._wts_reg = bool(wtsapi32.WTSRegisterSessionNotification(self.hwnd, 0))
@@ -1703,6 +1770,10 @@ class Tray:
                     return charging_prio[0][2]
             online.sort()
             return online[0][3]
+        # 全部离线/休眠时：优先显示休眠中的鼠标（保留上次电量），不要误切去数小时前关机的耳机/手柄
+        mouse_r = self.latest.get("mouse")
+        if enabled.get("mouse", True) and (mouse_r is None or mouse_r.state == "sleep") and self.last.get("mouse"):
+            return "mouse"
         cached = []
         for idx, d in enumerate(DEVICES):
             did = d["id"]
@@ -1710,7 +1781,7 @@ class Tray:
                 continue
             last = self.last.get(did)
             if last is not None and last.level is not None:
-                cached.append((last.level, 1 if last.charging else 0, idx, did))
+                cached.append((-last.time.timestamp(), last.level, idx, did))
         if cached:
             cached.sort()
             return cached[0][3]
@@ -1723,6 +1794,7 @@ class Tray:
         for d in DEVICES:
             did = d["id"]
             r = self.latest.get(did)
+            last = self.last.get(did)
             mark = "▶ " if did == active_id else ""
             if r is not None and r.ok:
                 p = "~" if r.approx else ""
@@ -1730,6 +1802,10 @@ class Tray:
                 lines.append(f"{mark}{d['short']}：{p}{r.level}%{ch}")
                 if latest_t is None or r.time > latest_t:
                     latest_t = r.time
+            elif r is not None and r.state == "sleep" and did == "mouse" and last is not None:
+                lines.append(f"{mark}{d['short']}：{last.level}% (休眠)")
+                if latest_t is None or last.time > latest_t:
+                    latest_t = last.time
             elif r is not None:
                 st = "休眠" if r.state == "sleep" else "未连接"
                 lines.append(f"{mark}{d['short']}：{st}")
@@ -1790,7 +1866,7 @@ class Tray:
         specs = self._desired_icons()
         want_uids = {uid for uid, _, _ in specs}
 
-        for uid in list(self.added):
+        for uid in list(self.added | set(self.hicons)):
             if uid not in want_uids:
                 self._delete_uid(uid)
 
@@ -1829,6 +1905,7 @@ class Tray:
                         self.added.add(uid)
                     else:
                         self.added.discard(uid)
+                        self.retry_left = max(self.retry_left, 10)
             old = self.hicons.get(uid)
             if old:
                 user32.DestroyIcon(old)
@@ -1851,14 +1928,17 @@ class Tray:
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(n))
 
     def set_timer(self):
+        self._last_poll_wall = time.time()
         user32.SetTimer(self.hwnd, TIMER_POLL, int(self.cfg["interval"]) * 1000, None)
 
     def _schedule_wake_refresh(self, delays=(3000, 10000, 25000)):
-        """休眠/现代待机唤醒或锁屏解锁后，重设轮询定时器并分段重试，等 USB 和无线设备重连。"""
-        dlog("检测到系统唤醒/解锁，重置状态并安排刷新", delays)
+        """休眠/现代待机唤醒、亮屏或锁屏解锁后，重设状态并分段重试，等 USB 和无线设备重连。"""
+        dlog("检测到系统唤醒/亮屏/解锁，重置状态并安排刷新", delays)
+        self._suspend_until = 0.0
+        self.retry_left = 15
         _good_tid.clear()
         if self.reading:
-            self.read_gen += 1      # 丢弃休眠前可能悬挂的旧线程结果，绝不永久死锁
+            self.read_gen += 1
             self.reading = False
         self.set_timer()
         self.update_icons()
@@ -1869,10 +1949,10 @@ class Tray:
     def start_read(self):
         now = time.monotonic()
         if self.reading:
-            # 15 秒看门狗：若后台线程在系统休眠/USB 重置时卡住，自动解锁不宕机
-            if now - self.reading_since < 15.0:
+            # 20 秒看门狗（远大于 read_all 7 秒总超时）：若旧线程在系统休眠/驱动重置时卡住，自动解锁
+            if now - self.reading_since < 20.0:
                 return
-            dlog("读取超过 15 秒未返回，重置读取状态")
+            dlog("读取超过 20 秒未返回，重置读取状态")
             self.read_gen += 1
             self.reading = False
         self.reading = True
@@ -1893,6 +1973,15 @@ class Tray:
                 user32.PostMessageW(self.hwnd, WM_READ_DONE, gen, 0)
         threading.Thread(target=work, daemon=True).start()
 
+    def _arm_mouse_wake_watch(self, need_watch):
+        if need_watch:
+            tick, _ = last_input_info()
+            self._sleep_input_tick = tick
+            user32.SetTimer(self.hwnd, TIMER_WAKE_MOUSE, 4000, None)
+        else:
+            self._sleep_input_tick = None
+            user32.KillTimer(self.hwnd, TIMER_WAKE_MOUSE)
+
     def on_read_done(self, gen=None):
         if gen is None or gen == self.read_gen:
             self.reading = False
@@ -1906,6 +1995,7 @@ class Tray:
                 break
         if res is None:
             return
+        self._last_poll_wall = time.time()
         thr = int(self.cfg.get("low_alert", 0) or 0)
         any_ok = False
         for dev_id, r in res.items():
@@ -1921,9 +2011,11 @@ class Tray:
                         self.balloon(d["uid_base"] + 1, "外设电量低", f"{d['name']} 剩余 {r.level}%，请及时充电")
                 elif r.charging or r.level > thr + 5:
                     self.low_alerted.discard(dev_id)
+        # 鼠标处于休眠态时，用极轻量的 GetLastInputInfo 监听用户动鼠标，一动立刻刷新
+        mouse_r = res.get("mouse")
+        self._arm_mouse_wake_watch(bool(mouse_r and mouse_r.state == "sleep"))
         # 唤醒后的分段重试：主设备鼠标一旦读成功就提前结束，避免多余唤醒
         if self._wake_delays:
-            mouse_r = res.get("mouse")
             if (mouse_r and mouse_r.ok) or (any_ok and len(self._wake_delays) == 1):
                 self._wake_delays.clear()
                 user32.KillTimer(self.hwnd, TIMER_RESUME)
@@ -1935,6 +2027,7 @@ class Tray:
         try:
             if msg == WM_TRAY:
                 if lp == WM_LBUTTONUP:
+                    self._suspend_until = 0.0
                     self.start_read()
                 elif lp == WM_RBUTTONUP:
                     bring_or_launch_panel()
@@ -1944,13 +2037,28 @@ class Tray:
                 return 0
             if msg == WM_TIMER:
                 if wp == TIMER_POLL:
-                    self.start_read()
+                    if time.monotonic() < self._suspend_until:
+                        return 0
+                    # 兜底检测：即使系统休眠未投递电源消息，墙钟跳变也能立刻识别并走唤醒流程
+                    wall_gap = time.time() - self._last_poll_wall
+                    self._last_poll_wall = time.time()
+                    if wall_gap > max(int(self.cfg["interval"]) + 45, 120):
+                        self._schedule_wake_refresh((2000, 10000))
+                    else:
+                        self.start_read()
                 elif wp == TIMER_DEVCHANGE:
                     user32.KillTimer(hwnd, TIMER_DEVCHANGE)
+                    self._suspend_until = 0.0
                     self.start_read()
                 elif wp == TIMER_RESUME:
                     user32.KillTimer(hwnd, TIMER_RESUME)
                     self.start_read()
+                elif wp == TIMER_WAKE_MOUSE:
+                    tick, idle_ms = last_input_info()
+                    if tick is not None and tick != self._sleep_input_tick and idle_ms < 4500:
+                        dlog("检测到用户操作，自动唤醒刷新鼠标电量")
+                        self._arm_mouse_wake_watch(False)
+                        self.start_read()
                 elif wp == TIMER_RETRY:
                     user32.KillTimer(hwnd, TIMER_RETRY)
                     self.retry_left -= 1
@@ -1958,13 +2066,23 @@ class Tray:
                 return 0
             if msg == WM_POWERBROADCAST:
                 if wp == PBT_APMSUSPEND:
-                    dlog("系统即将休眠/睡眠，暂停轮询定时器")
-                    user32.KillTimer(hwnd, TIMER_POLL)
+                    # 绝不 KillTimer(TIMER_POLL)！现代待机偶发不配对发送 RESUME，只短暂静默 15 秒防休眠前发包
+                    dlog("系统即将休眠/待机，短时静默 15 秒（保留主轮询定时器）")
+                    self._suspend_until = time.monotonic() + 15.0
                     user32.KillTimer(hwnd, TIMER_DEVCHANGE)
                     user32.KillTimer(hwnd, TIMER_RESUME)
+                    self._arm_mouse_wake_watch(False)
                     self._wake_delays.clear()
                 elif wp in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
                     self._schedule_wake_refresh((3000, 10000, 25000))
+                elif wp == PBT_POWERSETTINGCHANGE and lp:
+                    ps = ctypes.cast(lp, ctypes.POINTER(POWERBROADCAST_SETTING)).contents
+                    if bytes(ps.PowerSetting) == bytes(GUID_CONSOLE_DISPLAY_STATE):
+                        prev = self._display_state
+                        self._display_state = ps.Data
+                        dlog("显示器电源状态变化", prev, "→", ps.Data)
+                        if prev == 0 and ps.Data == 1:
+                            self._schedule_wake_refresh((2000, 9000))
                 return 1
             if msg == WM_WTSSESSION_CHANGE:
                 if wp == WTS_SESSION_UNLOCK:
@@ -1982,31 +2100,38 @@ class Tray:
                 return 0
             if msg == WM_RELOAD:
                 self.cfg = load_config()
+                self._suspend_until = 0.0
                 self.set_timer()
                 self.update_icons()
                 self.start_read()
                 return 0
             if msg == WM_REFRESH:
+                self._suspend_until = 0.0
                 self.start_read()
                 return 0
             if msg == self.msg_taskbar and msg:
                 self.added.clear()
+                self.retry_left = 15
                 self.update_icons()
                 return 0
             if msg in (WM_CLOSE, WM_ENDSESSION) and (msg == WM_CLOSE or wp):
                 user32.DestroyWindow(hwnd)
                 return 0
             if msg == WM_DESTROY:
-                user32.KillTimer(hwnd, TIMER_POLL)
-                user32.KillTimer(hwnd, TIMER_DEVCHANGE)
-                user32.KillTimer(hwnd, TIMER_RETRY)
-                user32.KillTimer(hwnd, TIMER_RESUME)
+                for tid in (TIMER_POLL, TIMER_DEVCHANGE, TIMER_RETRY, TIMER_RESUME, TIMER_WAKE_MOUSE):
+                    user32.KillTimer(hwnd, tid)
                 if self._power_reg:
                     try:
                         user32.UnregisterSuspendResumeNotification(self._power_reg)
                     except Exception:
                         pass
                     self._power_reg = None
+                if self._disp_reg:
+                    try:
+                        user32.UnregisterPowerSettingNotification(self._disp_reg)
+                    except Exception:
+                        pass
+                    self._disp_reg = None
                 if self._wts_reg and wtsapi32 is not None:
                     try:
                         wtsapi32.WTSUnRegisterSessionNotification(hwnd)
@@ -2026,6 +2151,10 @@ class Tray:
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+        try:
+            user32.UnregisterClassW(TRAY_CLASS, kernel32.GetModuleHandleW(None))
+        except Exception:
+            pass
 
 
 def run_tray():
@@ -2462,7 +2591,11 @@ class Panel:
         cfg = dict(self.cfg)
 
         def work():
-            self.q.put(read_all(cfg))
+            try:
+                res = read_all(cfg)
+            except Exception as e:
+                res = {d["id"]: Reading(d["id"], state="error", msg=f"读取异常：{e}") for d in DEVICES}
+            self.q.put(res)
         threading.Thread(target=work, daemon=True).start()
 
     def pump(self):
